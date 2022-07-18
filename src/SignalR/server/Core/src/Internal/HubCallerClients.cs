@@ -8,14 +8,14 @@ internal sealed class HubCallerClients : IHubCallerClients
     private readonly string _connectionId;
     private readonly IHubClients _hubClients;
     private readonly string[] _currentConnectionId;
-    private readonly bool _parallelEnabled;
+    private readonly SemaphoreSlim? _parallelInvokes;
 
-    public HubCallerClients(IHubClients hubClients, string connectionId, bool parallelEnabled)
+    public HubCallerClients(IHubClients hubClients, string connectionId, SemaphoreSlim? parallelInvokes)
     {
         _connectionId = connectionId;
         _hubClients = hubClients;
         _currentConnectionId = new[] { _connectionId };
-        _parallelEnabled = parallelEnabled;
+        _parallelInvokes = parallelInvokes;
     }
 
     IClientProxy IHubCallerClients<IClientProxy>.Caller => Caller;
@@ -23,11 +23,11 @@ internal sealed class HubCallerClients : IHubCallerClients
     {
         get
         {
-            if (!_parallelEnabled)
+            if (_parallelInvokes is null)
             {
                 return new NotParallelSingleClientProxy(_hubClients.Client(_connectionId));
             }
-            return _hubClients.Client(_connectionId);
+            return new SingleClientProxy(_hubClients.Client(_connectionId), _parallelInvokes);
         }
     }
 
@@ -43,11 +43,11 @@ internal sealed class HubCallerClients : IHubCallerClients
     IClientProxy IHubClients<IClientProxy>.Client(string connectionId) => Client(connectionId);
     public ISingleClientProxy Client(string connectionId)
     {
-        if (!_parallelEnabled)
+        if (_parallelInvokes is null)
         {
             return new NotParallelSingleClientProxy(_hubClients.Client(connectionId));
         }
-        return _hubClients.Client(connectionId);
+        return new SingleClientProxy(_hubClients.Client(connectionId), _parallelInvokes);
     }
 
     public IClientProxy Group(string groupName)
@@ -97,6 +97,40 @@ internal sealed class HubCallerClients : IHubCallerClients
         public Task<T> InvokeCoreAsync<T>(string method, object?[] args, CancellationToken cancellationToken = default)
         {
             throw new InvalidOperationException("Client results inside a Hub method requires HubOptions.MaximumParallelInvocationsPerClient to be greater than 1.");
+        }
+
+        public Task SendCoreAsync(string method, object?[] args, CancellationToken cancellationToken = default)
+        {
+            return _proxy.SendCoreAsync(method, args, cancellationToken);
+        }
+    }
+
+    private sealed class SingleClientProxy : ISingleClientProxy
+    {
+        private readonly ISingleClientProxy _proxy;
+        private readonly SemaphoreSlim _parallelInvokes;
+
+        public SingleClientProxy(ISingleClientProxy hubClients, SemaphoreSlim parallelInvokes)
+        {
+            _proxy = hubClients;
+            _parallelInvokes = parallelInvokes;
+        }
+
+        public async Task<T> InvokeCoreAsync<T>(string method, object?[] args, CancellationToken cancellationToken = default)
+        {
+            // Releases the SemaphoreSlim that is blocking pending invokes, which in turn can block the receive loop.
+            // Because we are waiting for a result from the client we need to let the receive loop run otherwise we'll be blocked forever
+            _parallelInvokes.Release();
+            try
+            {
+                var result = await _proxy.InvokeCoreAsync<T>(method, args, cancellationToken);
+                return result;
+            }
+            finally
+            {
+                // Re-acquire the SemaphoreSlim, this is because when the hub method completes it will call release
+                await _parallelInvokes.WaitAsync(CancellationToken.None);
+            }
         }
 
         public Task SendCoreAsync(string method, object?[] args, CancellationToken cancellationToken = default)
